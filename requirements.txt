@@ -1,0 +1,11 @@
+# HTTP client — async with connection pooling
+httpx==0.27.2
+
+# Telegram bot framework
+aiogram==3.13.1
+
+# Database — asyncpg (optional, graceful skip if DATABASE_URL not set)
+asyncpg==0.30.0
+
+# Environment variable loading (Railway injects env vars natively, but useful locally)
+python-dotenv==1.0.1
