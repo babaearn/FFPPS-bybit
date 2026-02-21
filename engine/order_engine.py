@@ -91,7 +91,9 @@ class OrderEngine:
 
     async def _paper_open(self, opp: FundingOpportunity) -> Position:
         slippage = self._cfg.slippage_pct
-        mark = opp.mark_price
+        # Fetch live mark price at entry time — opp.mark_price can be 30-90s stale
+        live_mark = await self.fetch_mark_price(opp.symbol)
+        mark = live_mark if live_mark else opp.mark_price
 
         if opp.direction == "LONG":
             entry_price = mark * (1 + slippage)
@@ -360,14 +362,16 @@ class OrderEngine:
     async def _poll_fill(
         self, symbol: str, order_id: str, max_attempts: int = 3
     ) -> Optional[float]:
-        """Poll open orders to get fill price. Returns avg_price or None."""
-        base_url = get_bybit_base_url()
+        """Poll order history to get fill price. Returns avg_price or None.
+        Market IOC orders fill immediately and appear in /v5/order/history,
+        NOT in /v5/order/realtime (which only shows open orders).
+        """
         for attempt in range(max_attempts):
             await asyncio.sleep(0.5)
             try:
                 result = await self._bybit_request(
                     "GET",
-                    "/v5/order/realtime",
+                    "/v5/order/history",
                     {"category": "linear", "symbol": symbol, "orderId": order_id},
                 )
                 items = result.get("list", [])
