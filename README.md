@@ -1,6 +1,6 @@
-# Funding Momentum Sniper
+# Funding Carry Farmer
 
-A production-grade cryptocurrency funding rate momentum bot for Bybit linear perpetuals.
+A Bybit linear perpetual funding-rate bot that targets the funding-receiving side, holds through settlement, and exits shortly after funding is credited.
 
 ---
 
@@ -8,53 +8,57 @@ A production-grade cryptocurrency funding rate momentum bot for Bybit linear per
 
 ### Core Thesis
 
-In the final 90 seconds before a funding settlement, traders rush to open positions to collect the funding payment. This creates predictable short-term price momentum in the direction of the funding bias. The bot enters at T-90s, rides the momentum, and exits at T-5s (hard stop). **We are not holding to collect funding — we are trading the momentum caused by others trying to collect it.**
+This version is designed to behave more like a funding farmer than a pre-funding momentum sniper.
 
-### Trade Rules
+- If funding is positive, shorts receive funding, so the bot prefers `SHORT`.
+- If funding is negative, longs receive funding, so the bot prefers `LONG`.
+- The bot only trades when estimated funding income is expected to exceed entry/exit fees plus an optional hedge-cost estimate.
+
+This version now includes a virtual paper hedge leg so you can estimate carry behavior with reduced directional exposure. It is suitable for paper trading and carry research, but it is **not yet a full institutional live delta-neutral hedge stack**.
+
+### Trade Lifecycle
 
 | Step | Time | Action |
 |------|------|--------|
-| 1 | Continuous | Scan all Bybit linear perpetuals every 30s |
-| 2 | Detection | Filter: `abs(funding_rate) >= 0.5%` AND `OI >= $500k` |
-| 3 | T-95s | Re-verify funding rate still meets threshold — skip if dropped |
-| 4 | T-90s | Fire MARKET entry order |
-| 5 | T-90s | Place LIMIT take-profit at +0.32% (reduceOnly) |
-| 6 | Any | If TP fills before T-5s — trade closed immediately |
-| 7 | T-5s | Hard exit: cancel TP, fire MARKET close — no exceptions |
+| 1 | Continuous | Scan Bybit linear perpetuals every 30s |
+| 2 | Detection | Filter by `abs(funding_rate) >= threshold`, `OI >= min_oi`, and minimum expected net edge |
+| 3 | T-30s | Re-check live funding rate |
+| 4 | T-20s | Enter on the funding-receiving side |
+| 5 | Funding time | Hold through settlement |
+| 6 | Funding+10s | Apply paper funding credit |
+| 7 | Funding+15s | Exit at market |
 
-**Direction:**
-- `funding_rate >= +0.5%` → SHORT (shorts pay longs, longs rush in → upward momentum)
-- `funding_rate <= -0.5%` → LONG  (longs pay shorts, shorts rush in → downward momentum)
+### Current Defaults
 
-### Position Sizing
-
-- Fixed notional per trade: `$500` (configurable)
-- Paper capital: `$1000` (for ROI% calculation)
-- Max leverage: `10x` (configurable)
-- Sizing is flat — not scaled by funding rate magnitude
+- Funding threshold: `2.0%`
+- Position size: `$500`
+- Entry fee model: taker
+- Exit fee model: taker
+- Minimum expected net edge: `$1.50`
+- Estimated hedge cost: `$0.00`
 
 ---
 
 ## Architecture
 
 ```
-funding-sniper-bot/
-├── main.py                    # Entry point, component wiring
-├── config.py                  # Static + mutable runtime config
+FFPPS-bybit/
+├── main.py
+├── config.py
 ├── scanner/
-│   └── funding_scanner.py     # Bybit tickers poll, opportunity detection
+│   └── funding_scanner.py
 ├── timer/
-│   └── entry_timer.py         # Precision countdown, T-95s gate, T-90s entry
+│   └── entry_timer.py
 ├── engine/
-│   ├── order_engine.py        # Paper/live order abstraction
-│   ├── position_manager.py    # Position state machine
-│   └── pnl_engine.py         # Per-trade PnL + aggregate stats
+│   ├── order_engine.py
+│   ├── position_manager.py
+│   └── pnl_engine.py
 ├── risk/
-│   └── risk_manager.py        # Pre-trade gate checks
+│   └── risk_manager.py
 ├── database/
-│   └── db.py                  # asyncpg persistence (optional)
+│   └── db.py
 ├── telegram/
-│   └── bot.py                 # aiogram v3 commands + proactive alerts
+│   └── bot.py
 ├── Dockerfile
 ├── railway.toml
 ├── requirements.txt
@@ -65,82 +69,34 @@ funding-sniper-bot/
 
 ## Local Setup
 
-### Prerequisites
-
-- Python 3.11+
-- A Bybit account (or testnet account for paper mode)
-- A Telegram bot token from [@BotFather](https://t.me/BotFather)
-- Your Telegram chat ID (send `/start` to [@userinfobot](https://t.me/userinfobot))
-
-### Install
-
 ```bash
 git clone <repo>
-cd funding-sniper-bot
+cd FFPPS-bybit
 
 python -m venv venv
-source venv/bin/activate   # Windows: venv\Scripts\activate
-
+source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### Configure
+Then copy:
 
 ```bash
 cp .env.example .env
-# Edit .env with your values
 ```
 
-Minimum required fields:
-```
-TELEGRAM_BOT_TOKEN=<your bot token>
-TELEGRAM_CHAT_ID=<your chat id>
+Set at minimum:
+
+```env
+TELEGRAM_BOT_TOKEN=...
+TELEGRAM_CHAT_ID=...
 PAPER_MODE=true
 ```
 
-### Run
+Run:
 
 ```bash
 python main.py
 ```
-
-The bot will log to stdout and send a startup message to your Telegram chat.
-
----
-
-## Railway Deployment
-
-### 1. Create Railway project
-
-```bash
-npm install -g @railway/cli
-railway login
-railway init
-```
-
-### 2. Set environment variables
-
-In the Railway dashboard → your project → Variables, add all variables from `.env.example`.
-
-Or via CLI:
-```bash
-railway variables set TELEGRAM_BOT_TOKEN=xxx
-railway variables set TELEGRAM_CHAT_ID=xxx
-railway variables set PAPER_MODE=true
-# ... etc
-```
-
-### 3. Add PostgreSQL (optional)
-
-In Railway dashboard: New → Database → PostgreSQL. The `DATABASE_URL` variable is injected automatically.
-
-### 4. Deploy
-
-```bash
-railway up
-```
-
-Railway uses the `Dockerfile` as defined in `railway.toml`. Logs stream in real time from the dashboard.
 
 ---
 
@@ -148,39 +104,42 @@ Railway uses the `Dockerfile` as defined in `railway.toml`. Logs stream in real 
 
 | Command | Description |
 |---------|-------------|
-| `/status` | Active positions with entry price, TP, time to hard exit. Bot state (ACTIVE / EMERGENCY_STOP). Config snapshot. |
-| `/pnl` | Today's P&L: net PnL, trades, wins, losses, win rate, fees, best/worst trade. All-time totals and ROI%. |
-| `/journal [n]` | Last `n` trades (default 10). Shows symbol, direction, close type, net PnL%, duration. |
-| `/scan` | Trigger an immediate scan. Returns top qualifying symbols sorted by funding rate magnitude. |
-| `/next` | All qualifying events in the next 60 minutes, sorted by time to funding. This is the live trade queue. |
-| `/config` | Display all current configuration parameters. |
-| `/set <param> <value>` | Update a config parameter live without restart (see below). |
-| `/forceclose` | Immediately close ALL open positions at market. No confirmation. |
-| `/emergencystop` | Block all new entries. Existing positions unaffected. |
-| `/resume` | Re-enable entries after emergency stop. |
+| `/status` | Active carry positions, planned exits, and config snapshot |
+| `/pnl` | Today and all-time PnL |
+| `/journal [n]` | Last `n` trades |
+| `/scan` | Live funding-carry candidates |
+| `/next` | Upcoming qualifying funding events |
+| `/config` | Current runtime config |
+| `/set <param> <value>` | Update runtime config live |
+| `/forceclose` | Close all open positions |
+| `/emergencystop` | Block new entries |
+| `/resume` | Resume entries |
 
-### `/set` Parameters
+Supported `/set` params:
 
+- `threshold`
+- `position_size`
+- `leverage`
+- `daily_loss`
+- `min_oi`
+- `min_edge`
+- `hedge_cost`
+- `hedge_ratio`
+- `hedge_enabled`
+
+---
+
+## Replay Research
+
+Use [`replay_carry.py`](/Users/mudrex/Desktop/fundingrate-%20faming%20/FFPPS-bybit/replay_carry.py) to run a paper-only replay from `DATABASE_URL`.
+
+Example:
+
+```bash
+DATABASE_URL=postgresql://... python replay_carry.py
 ```
-/set threshold 0.006        → Funding threshold (e.g. 0.006 = 0.6%)
-/set position_size 300      → Position size in USD
-/set leverage 5             → Max leverage
-/set daily_loss 100         → Daily loss limit in USD
-/set min_oi 1000000         → Minimum open interest in USD
-```
 
-### Proactive Alerts
-
-The bot pushes the following alerts automatically:
-
-| Alert | Trigger |
-|-------|---------|
-| `SCAN HIT` | New qualifying opportunity detected |
-| `CONFIRMATION FAILED` | T-95s gate: funding rate dropped below threshold |
-| `ENTRY FIRED` | T-90s market order placed with fill details |
-| `TP HIT` | Take-profit limit order filled |
-| `T-5s HARD EXIT` | Position force-closed at market |
-| `DAILY LOSS LIMIT` | Daily loss cap reached, new entries blocked |
+This script does not place orders or use capital.
 
 ---
 
@@ -188,37 +147,44 @@ The bot pushes the following alerts automatically:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PAPER_MODE` | `true` | `true` = simulate, `false` = live trading |
-| `PAPER_CAPITAL` | `1000` | Simulated account size (USD) |
-| `POSITION_SIZE_USD` | `500` | Fixed notional per trade (USD) |
-| `MAX_LEVERAGE` | `10` | Max leverage for exchange margin |
-| `FUNDING_THRESHOLD` | `0.005` | Min abs funding rate (0.5%) |
-| `ENTRY_WINDOW_SEC` | `90` | Enter at T-90s before settlement |
-| `CONFIRM_GATE_SEC` | `95` | Re-verify at T-95s |
-| `HARD_EXIT_SEC` | `5` | Force close at T-5s |
-| `TP_PCT` | `0.0032` | Take-profit target (0.32%) |
-| `SLIPPAGE_PCT` | `0.0003` | Paper mode slippage simulation (0.03%) |
-| `MIN_OI_USD` | `500000` | Minimum open interest filter |
+| `PAPER_MODE` | `true` | Simulated or live mode |
+| `PAPER_CAPITAL` | `1000` | Paper capital used for ROI |
+| `POSITION_SIZE_USD` | `500` | Per-trade notional |
+| `MAX_LEVERAGE` | `10` | Max leverage |
+| `FUNDING_THRESHOLD` | `0.02` | Min absolute funding rate |
+| `CONFIRM_GATE_SEC` | `30` | Live funding re-check time |
+| `ENTRY_WINDOW_SEC` | `20` | Entry before funding |
+| `FUNDING_SETTLE_GRACE_SEC` | `10` | Delay before applying paper funding credit |
+| `HARD_EXIT_SEC` | `15` | Exit after settlement |
+| `SLIPPAGE_PCT` | `0.0003` | Paper slippage |
+| `MIN_EXPECTED_NET_EDGE_USD` | `1.5` | Minimum estimated net carry edge |
+| `ESTIMATED_HEDGE_COST_USD` | `0.0` | Extra per-trade hedge-cost estimate |
+| `HEDGE_ENABLED` | `true` | Enable paper hedge leg |
+| `HEDGE_RATIO` | `1.0` | Hedge size relative to funding leg |
+| `HEDGE_FEE_RATE` | `0.00055` | Hedge fee assumption |
+| `HEDGE_SLIPPAGE_PCT` | `0.0003` | Hedge slippage assumption |
+| `MIN_OI_USD` | `500000` | Minimum open interest |
 | `MAX_DAILY_LOSS_USD` | `50` | Daily loss cap |
-| `SCAN_INTERVAL_SEC` | `30` | Scanner polling interval |
-| `TAKER_FEE_RATE` | `0.00055` | Bybit linear taker fee |
-| `MAKER_FEE_RATE` | `0.0002` | Bybit linear maker fee |
+| `SCAN_INTERVAL_SEC` | `30` | Scanner poll interval |
+| `TAKER_FEE_RATE` | `0.00055` | Taker fee assumption |
+| `MAKER_FEE_RATE` | `0.0002` | Reserved for future maker logic |
 | `LOG_LEVEL` | `INFO` | Logging level |
+
+---
+
+## Notes
+
+- Paper mode now includes both a funding-credit component and a virtual hedge leg in PnL.
+- DB persistence now stores `entry_time`, `exit_time`, `funding_pnl`, and hedge metrics.
+- A true institutional setup still needs live hedge execution, hedge reconciliation, and venue-aware basis routing.
 
 ---
 
 ## Risk Disclosure
 
-**This software is provided for educational and research purposes. Cryptocurrency trading involves substantial risk of loss.**
+This project is for research and educational use only.
 
-- Past performance of any strategy does not guarantee future results.
-- Funding rates can change rapidly — the bot may enter positions that immediately go against you.
-- Market orders in volatile conditions may fill at significantly worse prices than expected.
-- The T-5s hard exit is the only position risk control. There is no stop loss.
-- Maximum exposure per symbol is approximately 85 seconds.
-- Multiple concurrent positions can be open simultaneously.
-- Run in `PAPER_MODE=true` and observe behavior thoroughly before enabling live trading.
-- Start with very small position sizes when going live.
-- Never risk capital you cannot afford to lose.
-
-The authors accept no liability for trading losses arising from use of this software.
+- Funding can change before settlement.
+- A one-leg carry trade still carries directional risk.
+- Live carry farming without a hedge is not institutional-grade delta-neutral execution.
+- Test thoroughly in paper mode before considering any live deployment.

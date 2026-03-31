@@ -25,9 +25,15 @@ class FundingOpportunity:
     next_funding_time: datetime           # UTC
     mark_price: float
     open_interest_usd: float
-    direction: str                        # "LONG" | "SHORT"
+    volume_24h_usd: float
+    turnover_24h_usd: float
+    direction: str                        # receiver side: "LONG" | "SHORT"
     detected_at: datetime                 # UTC
     interval_hours: float                 # derived from nextFundingTime gap
+    estimated_funding_pnl_usd: float
+    estimated_total_cost_usd: float
+    expected_net_edge_usd: float
+    expected_net_edge_bps: float
 
 
 OpportunityCallback = Callable[[FundingOpportunity], Awaitable[None]]
@@ -83,7 +89,7 @@ class FundingScanner:
     async def fetch_live_rate(self, symbol: str) -> Optional[float]:
         """
         Re-fetch the current funding rate for a single symbol.
-        Used by EntryTimer at T-95s confirmation gate.
+        Used by EntryTimer at the confirmation gate.
         """
         try:
             raw = await self._fetch_tickers(symbol=symbol)
@@ -191,6 +197,8 @@ class FundingScanner:
             next_funding_ms = int(item.get("nextFundingTime") or 0)
             mark_price = float(item.get("markPrice") or 0)
             oi_value = float(item.get("openInterestValue") or 0)
+            volume_24h = float(item.get("volume24h") or 0)
+            turnover_24h = float(item.get("turnover24h") or 0)
         except (KeyError, ValueError, TypeError):
             return None
 
@@ -202,8 +210,8 @@ class FundingScanner:
         )
         time_to_funding = (next_funding_time - now).total_seconds()
 
-        # Filter: between 91s and 3600s away
-        if not (91 < time_to_funding <= 3600):
+        min_time_to_funding = max(self._cfg.confirm_gate_sec + 1, 10)
+        if not (min_time_to_funding < time_to_funding <= 3600):
             return None
 
         # Filter: minimum absolute funding rate
@@ -218,7 +226,22 @@ class FundingScanner:
         if symbol in active_symbols:
             return None
 
-        direction = "SHORT" if funding_rate >= self._cfg.funding_threshold else "LONG"
+        direction = "SHORT" if funding_rate > 0 else "LONG"
+
+        estimated_funding_pnl_usd = self._cfg.position_size_usd * abs(funding_rate)
+        estimated_total_cost_usd = (
+            self._cfg.position_size_usd * self._cfg.taker_fee_rate * 2
+            + self._cfg.estimated_hedge_cost_usd
+        )
+        expected_net_edge_usd = estimated_funding_pnl_usd - estimated_total_cost_usd
+        expected_net_edge_bps = (
+            expected_net_edge_usd / self._cfg.position_size_usd * 10_000
+            if self._cfg.position_size_usd
+            else 0.0
+        )
+
+        if expected_net_edge_usd < self._cfg.min_expected_net_edge_usd:
+            return None
 
         # Derive approximate interval in hours from time_to_funding
         # Common Bybit intervals: 1h, 2h, 4h, 8h
@@ -230,9 +253,15 @@ class FundingScanner:
             next_funding_time=next_funding_time,
             mark_price=mark_price,
             open_interest_usd=oi_value,
+            volume_24h_usd=volume_24h,
+            turnover_24h_usd=turnover_24h,
             direction=direction,
             detected_at=now,
             interval_hours=interval_hours,
+            estimated_funding_pnl_usd=estimated_funding_pnl_usd,
+            estimated_total_cost_usd=estimated_total_cost_usd,
+            expected_net_edge_usd=expected_net_edge_usd,
+            expected_net_edge_bps=expected_net_edge_bps,
         )
 
     @staticmethod

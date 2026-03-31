@@ -95,18 +95,27 @@ class RuntimeConfig:
     max_leverage: int = field(default_factory=lambda: _env_int("MAX_LEVERAGE", 10))
 
     # Strategy timing
-    entry_window_sec: int = field(default_factory=lambda: _env_int("ENTRY_WINDOW_SEC", 90))
-    confirm_gate_sec: int = field(default_factory=lambda: _env_int("CONFIRM_GATE_SEC", 95))
-    hard_exit_sec: int = field(default_factory=lambda: _env_int("HARD_EXIT_SEC", 5))
+    entry_window_sec: int = field(default_factory=lambda: _env_int("ENTRY_WINDOW_SEC", 20))
+    confirm_gate_sec: int = field(default_factory=lambda: _env_int("CONFIRM_GATE_SEC", 30))
+    hard_exit_sec: int = field(default_factory=lambda: _env_int("HARD_EXIT_SEC", 15))
+    funding_settle_grace_sec: int = field(default_factory=lambda: _env_int("FUNDING_SETTLE_GRACE_SEC", 10))
 
     # Strategy thresholds
-    funding_threshold: float = field(default_factory=lambda: _env_float("FUNDING_THRESHOLD", 0.005))
+    funding_threshold: float = field(default_factory=lambda: _env_float("FUNDING_THRESHOLD", 0.02))
     tp_pct: float = field(default_factory=lambda: _env_float("TP_PCT", 0.0032))
     slippage_pct: float = field(default_factory=lambda: _env_float("SLIPPAGE_PCT", 0.0003))
+    min_expected_net_edge_usd: float = field(default_factory=lambda: _env_float("MIN_EXPECTED_NET_EDGE_USD", 1.5))
+    estimated_hedge_cost_usd: float = field(default_factory=lambda: _env_float("ESTIMATED_HEDGE_COST_USD", 0.0))
 
     # Risk
     min_oi_usd: float = field(default_factory=lambda: _env_float("MIN_OI_USD", 500_000.0))
     max_daily_loss_usd: float = field(default_factory=lambda: _env_float("MAX_DAILY_LOSS_USD", 50.0))
+
+    # Hedge
+    hedge_enabled: bool = field(default_factory=lambda: _env_bool("HEDGE_ENABLED", True))
+    hedge_ratio: float = field(default_factory=lambda: _env_float("HEDGE_RATIO", 1.0))
+    hedge_fee_rate: float = field(default_factory=lambda: _env_float("HEDGE_FEE_RATE", 0.00055))
+    hedge_slippage_pct: float = field(default_factory=lambda: _env_float("HEDGE_SLIPPAGE_PCT", 0.0003))
 
     # Scanner
     scan_interval_sec: int = field(default_factory=lambda: _env_int("SCAN_INTERVAL_SEC", 30))
@@ -165,8 +174,40 @@ class RuntimeConfig:
                 self.min_oi_usd = new_val
                 return True, f"min_oi updated: {old} → {new_val}"
 
+            elif param == "min_edge":
+                new_val = float(value)
+                if not (0.0 <= new_val <= 10_000.0):
+                    return False, "min_edge must be between 0 and 10000"
+                old = self.min_expected_net_edge_usd
+                self.min_expected_net_edge_usd = new_val
+                return True, f"min_edge updated: {old} → {new_val}"
+
+            elif param == "hedge_cost":
+                new_val = float(value)
+                if not (0.0 <= new_val <= 10_000.0):
+                    return False, "hedge_cost must be between 0 and 10000"
+                old = self.estimated_hedge_cost_usd
+                self.estimated_hedge_cost_usd = new_val
+                return True, f"hedge_cost updated: {old} → {new_val}"
+
+            elif param == "hedge_ratio":
+                new_val = float(value)
+                if not (0.0 <= new_val <= 2.0):
+                    return False, "hedge_ratio must be between 0 and 2"
+                old = self.hedge_ratio
+                self.hedge_ratio = new_val
+                return True, f"hedge_ratio updated: {old} → {new_val}"
+
+            elif param == "hedge_enabled":
+                normalized = value.strip().lower()
+                if normalized not in ("1", "0", "true", "false", "yes", "no"):
+                    return False, "hedge_enabled must be true/false"
+                old = self.hedge_enabled
+                self.hedge_enabled = normalized in ("1", "true", "yes")
+                return True, f"hedge_enabled updated: {old} → {self.hedge_enabled}"
+
             else:
-                supported = "threshold, position_size, leverage, daily_loss, min_oi"
+                supported = "threshold, position_size, leverage, daily_loss, min_oi, min_edge, hedge_cost, hedge_ratio, hedge_enabled"
                 return False, f"Unknown param '{param}'. Supported: {supported}"
 
         except (ValueError, TypeError) as exc:
@@ -182,12 +223,19 @@ class RuntimeConfig:
             "slippage_pct": self.slippage_pct,
             "min_oi_usd": self.min_oi_usd,
             "max_daily_loss_usd": self.max_daily_loss_usd,
+            "hedge_enabled": self.hedge_enabled,
+            "hedge_ratio": self.hedge_ratio,
+            "hedge_fee_rate": self.hedge_fee_rate,
+            "hedge_slippage_pct": self.hedge_slippage_pct,
             "scan_interval_sec": self.scan_interval_sec,
             "entry_window_sec": self.entry_window_sec,
             "confirm_gate_sec": self.confirm_gate_sec,
             "hard_exit_sec": self.hard_exit_sec,
+            "funding_settle_grace_sec": self.funding_settle_grace_sec,
             "taker_fee_rate": self.taker_fee_rate,
             "maker_fee_rate": self.maker_fee_rate,
+            "min_expected_net_edge_usd": self.min_expected_net_edge_usd,
+            "estimated_hedge_cost_usd": self.estimated_hedge_cost_usd,
             "paper_mode": PAPER_MODE,
             "emergency_stop": self.emergency_stop,
         }

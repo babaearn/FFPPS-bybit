@@ -25,16 +25,28 @@ CREATE TABLE IF NOT EXISTS trades (
     id              SERIAL PRIMARY KEY,
     trade_id        TEXT UNIQUE NOT NULL,
     symbol          TEXT NOT NULL,
+    funding_time    TIMESTAMPTZ,
+    detected_at     TIMESTAMPTZ,
     funding_rate    NUMERIC(10,6),
     interval_hours  NUMERIC(4,2),
     direction       TEXT,
     size            NUMERIC(20,8),
     entry_price     NUMERIC(20,8),
+    mark_price_snapshot NUMERIC(20,8),
+    open_interest_usd   NUMERIC(20,8),
+    volume_24h_usd      NUMERIC(20,8),
+    turnover_24h_usd    NUMERIC(20,8),
+    expected_net_edge_usd NUMERIC(20,8),
+    expected_net_edge_bps NUMERIC(20,8),
     tp_price        NUMERIC(20,8),
     exit_price      NUMERIC(20,8),
     close_type      TEXT,
     entry_fee       NUMERIC(20,8),
     exit_fee        NUMERIC(20,8),
+    funding_pnl     NUMERIC(20,8),
+    hedge_pnl       NUMERIC(20,8),
+    hedge_entry_fee NUMERIC(20,8),
+    hedge_exit_fee  NUMERIC(20,8),
     raw_pnl         NUMERIC(20,8),
     net_pnl         NUMERIC(20,8),
     net_pnl_pct     NUMERIC(10,6),
@@ -44,6 +56,30 @@ CREATE TABLE IF NOT EXISTS trades (
     timing_drift_ms INTEGER,
     created_at      TIMESTAMPTZ DEFAULT NOW()
 );
+"""
+
+ADD_FUNDING_PNL_COLUMN = """
+ALTER TABLE trades
+ADD COLUMN IF NOT EXISTS funding_pnl NUMERIC(20,8);
+"""
+
+ADD_HEDGE_COLUMNS = """
+ALTER TABLE trades
+ADD COLUMN IF NOT EXISTS hedge_pnl NUMERIC(20,8),
+ADD COLUMN IF NOT EXISTS hedge_entry_fee NUMERIC(20,8),
+ADD COLUMN IF NOT EXISTS hedge_exit_fee NUMERIC(20,8);
+"""
+
+ADD_MARKET_CONTEXT_COLUMNS = """
+ALTER TABLE trades
+ADD COLUMN IF NOT EXISTS funding_time TIMESTAMPTZ,
+ADD COLUMN IF NOT EXISTS detected_at TIMESTAMPTZ,
+ADD COLUMN IF NOT EXISTS mark_price_snapshot NUMERIC(20,8),
+ADD COLUMN IF NOT EXISTS open_interest_usd NUMERIC(20,8),
+ADD COLUMN IF NOT EXISTS volume_24h_usd NUMERIC(20,8),
+ADD COLUMN IF NOT EXISTS turnover_24h_usd NUMERIC(20,8),
+ADD COLUMN IF NOT EXISTS expected_net_edge_usd NUMERIC(20,8),
+ADD COLUMN IF NOT EXISTS expected_net_edge_bps NUMERIC(20,8);
 """
 
 CREATE_DAILY_STATS_TABLE = """
@@ -64,20 +100,34 @@ CREATE TABLE IF NOT EXISTS daily_stats (
 
 UPSERT_TRADE = """
 INSERT INTO trades (
-    trade_id, symbol, funding_rate, interval_hours, direction,
-    size, entry_price, tp_price, exit_price, close_type,
-    entry_fee, exit_fee, raw_pnl, net_pnl, net_pnl_pct,
-    entry_time, exit_time, duration_sec, timing_drift_ms
+    trade_id, symbol, funding_time, detected_at, funding_rate, interval_hours, direction,
+    size, entry_price, mark_price_snapshot, open_interest_usd, volume_24h_usd,
+    turnover_24h_usd, expected_net_edge_usd, expected_net_edge_bps, tp_price, exit_price, close_type,
+    entry_fee, exit_fee, funding_pnl, hedge_pnl, hedge_entry_fee, hedge_exit_fee,
+    raw_pnl, net_pnl, net_pnl_pct, entry_time, exit_time, duration_sec, timing_drift_ms
 ) VALUES (
-    $1, $2, $3, $4, $5,
-    $6, $7, $8, $9, $10,
-    $11, $12, $13, $14, $15,
-    $16, $17, $18, $19
+    $1, $2, $3, $4, $5, $6, $7,
+    $8, $9, $10, $11, $12,
+    $13, $14, $15, $16, $17, $18,
+    $19, $20, $21, $22, $23, $24,
+    $25, $26, $27, $28, $29, $30, $31
 )
 ON CONFLICT (trade_id) DO UPDATE SET
+    funding_time    = EXCLUDED.funding_time,
+    detected_at     = EXCLUDED.detected_at,
     exit_price      = EXCLUDED.exit_price,
     close_type      = EXCLUDED.close_type,
+    mark_price_snapshot = EXCLUDED.mark_price_snapshot,
+    open_interest_usd   = EXCLUDED.open_interest_usd,
+    volume_24h_usd      = EXCLUDED.volume_24h_usd,
+    turnover_24h_usd    = EXCLUDED.turnover_24h_usd,
+    expected_net_edge_usd = EXCLUDED.expected_net_edge_usd,
+    expected_net_edge_bps = EXCLUDED.expected_net_edge_bps,
     exit_fee        = EXCLUDED.exit_fee,
+    funding_pnl     = EXCLUDED.funding_pnl,
+    hedge_pnl       = EXCLUDED.hedge_pnl,
+    hedge_entry_fee = EXCLUDED.hedge_entry_fee,
+    hedge_exit_fee  = EXCLUDED.hedge_exit_fee,
     raw_pnl         = EXCLUDED.raw_pnl,
     net_pnl         = EXCLUDED.net_pnl,
     net_pnl_pct     = EXCLUDED.net_pnl_pct,
@@ -128,6 +178,9 @@ class Database:
             )
             async with self._pool.acquire() as conn:
                 await conn.execute(CREATE_TRADES_TABLE)
+                await conn.execute(ADD_FUNDING_PNL_COLUMN)
+                await conn.execute(ADD_HEDGE_COLUMNS)
+                await conn.execute(ADD_MARKET_CONTEXT_COLUMNS)
                 await conn.execute(CREATE_DAILY_STATS_TABLE)
             logger.info("Database: connected and schema ready")
         except Exception:
@@ -149,16 +202,28 @@ class Database:
                     UPSERT_TRADE,
                     result["trade_id"],
                     result["symbol"],
+                    result.get("funding_time"),
+                    result.get("detected_at"),
                     result.get("funding_rate", 0.0),
                     result.get("interval_hours", 0.0),
                     result["direction"],
                     result["size"],
                     result["entry_price"],
+                    result.get("mark_price_snapshot", 0.0),
+                    result.get("open_interest_usd", 0.0),
+                    result.get("volume_24h_usd", 0.0),
+                    result.get("turnover_24h_usd", 0.0),
+                    result.get("expected_net_edge_usd", 0.0),
+                    result.get("expected_net_edge_bps", 0.0),
                     result.get("tp_price"),
                     result.get("exit_price"),
                     result["close_type"],
                     result.get("entry_fee", 0.0),
                     result.get("exit_fee", 0.0),
+                    result.get("funding_pnl", 0.0),
+                    result.get("hedge_pnl", 0.0),
+                    result.get("hedge_entry_fee", 0.0),
+                    result.get("hedge_exit_fee", 0.0),
                     result.get("raw_pnl", 0.0),
                     result.get("net_pnl", 0.0),
                     result.get("net_pnl_pct", 0.0),

@@ -17,6 +17,7 @@ import httpx
 
 from config import RuntimeConfig, PAPER_MODE, get_bybit_base_url, mask_secret, BYBIT_API_KEY, BYBIT_API_SECRET
 from engine.position_manager import Position, PositionState
+from hedge.hedge_manager import HedgeManager
 from scanner.funding_scanner import FundingOpportunity
 
 if TYPE_CHECKING:
@@ -28,7 +29,7 @@ logger = logging.getLogger(__name__)
 class OrderEngine:
     """
     Single entry point for all order operations.
-    Paper mode: simulates fills with slippage, monitors TP via polling.
+    Paper mode: simulates fills with slippage.
     Live mode: calls Bybit v5 REST API with retry + exponential backoff.
     """
 
@@ -42,6 +43,7 @@ class OrderEngine:
         self._http = http_client
         self._pm = position_manager
         self._paper_mode = PAPER_MODE
+        self._hedge_manager = HedgeManager(cfg=cfg, order_engine=self)
         logger.info(
             "OrderEngine init | mode=%s | api_key=%s",
             "PAPER" if self._paper_mode else "LIVE",
@@ -63,7 +65,7 @@ class OrderEngine:
     async def close_position(self, position: Position, close_type: str) -> Position:
         """
         Execute exit order. Updates and returns the Position.
-        close_type: "T5_HARD_EXIT" | "FORCE" | "TIMEOUT"
+        close_type: "FUNDING_CAPTURE_EXIT" | "FORCE" | "TIMEOUT"
         """
         if self._paper_mode:
             return await self._paper_close(position, close_type)
@@ -104,11 +106,7 @@ class OrderEngine:
         entry_notional = size * entry_price
         entry_fee = entry_notional * self._cfg.taker_fee_rate
 
-        tp_pct = self._cfg.tp_pct
-        if opp.direction == "LONG":
-            tp_price = entry_price * (1 + tp_pct)
-        else:
-            tp_price = entry_price * (1 - tp_pct)
+        tp_price = entry_price
 
         trade_id = uuid.uuid4().hex
 
@@ -122,64 +120,37 @@ class OrderEngine:
             tp_order_id=f"paper_tp_{trade_id}",
             entry_time=datetime.now(timezone.utc),
             funding_time=opp.next_funding_time,
+            detected_at=opp.detected_at,
             funding_rate=opp.funding_rate,
             interval_hours=opp.interval_hours,
+            mark_price_snapshot=opp.mark_price,
+            open_interest_usd=opp.open_interest_usd,
+            volume_24h_usd=opp.volume_24h_usd,
+            turnover_24h_usd=opp.turnover_24h_usd,
+            expected_net_edge_usd=opp.expected_net_edge_usd,
+            expected_net_edge_bps=opp.expected_net_edge_bps,
             entry_fee=entry_fee,
             state=PositionState.OPEN,
         )
+
+        hedge = await self._hedge_manager.open_hedge(
+            symbol=opp.symbol,
+            direction=opp.direction,
+            size=size,
+        )
+        if hedge is not None:
+            position.attach_hedge(hedge)
+
         self._pm.add_position(position)
 
         logger.info(
-            "PAPER OPEN: %s %s | entry=%.6f | size=%.4f | tp=%.6f | fee=$%.4f",
+            "PAPER OPEN: %s %s | entry=%.6f | size=%.4f | funding_edge=$%.4f | fee=$%.4f | hedge=%s",
             opp.direction, opp.symbol,
-            entry_price, size, tp_price, entry_fee,
-        )
-
-        # Spawn TP monitoring task
-        asyncio.create_task(
-            self._paper_monitor_tp(position),
-            name=f"paper_tp_{opp.symbol}",
+            entry_price, size, opp.expected_net_edge_usd, entry_fee,
+            "on" if hedge is not None else "off",
         )
 
         return position
-
-    async def _paper_monitor_tp(self, position: Position) -> None:
-        """Poll mark price every 1 second, trigger TP when crossed."""
-        symbol = position.symbol
-        tp_price = position.tp_price
-        direction = position.direction
-
-        logger.debug("Paper TP monitor started: %s tp=%.6f", symbol, tp_price)
-
-        while True:
-            await asyncio.sleep(1)
-
-            if position.state != PositionState.OPEN:
-                logger.debug("Paper TP monitor: %s no longer OPEN, stopping", symbol)
-                return
-
-            mark = await self.fetch_mark_price(symbol)
-            if mark is None:
-                continue
-
-            tp_hit = (
-                (direction == "LONG" and mark >= tp_price)
-                or (direction == "SHORT" and mark <= tp_price)
-            )
-
-            if tp_hit:
-                logger.info("Paper TP HIT: %s mark=%.6f tp=%.6f", symbol, mark, tp_price)
-                exit_price = tp_price  # limit order fills at TP price
-                exit_notional = position.size * exit_price
-                exit_fee = exit_notional * self._cfg.maker_fee_rate
-
-                await self._pm.record_tp_fill(
-                    symbol=symbol,
-                    exit_price=exit_price,
-                    exit_fee=exit_fee,
-                    close_type="TP",
-                )
-                return
 
     async def _paper_close(self, position: Position, close_type: str) -> Position:
         slippage = self._cfg.slippage_pct
@@ -194,6 +165,13 @@ class OrderEngine:
 
         exit_notional = position.size * exit_price
         exit_fee = exit_notional * self._cfg.taker_fee_rate
+
+        hedge = await self._hedge_manager.close_hedge(
+            symbol=position.symbol,
+            hedge=_position_to_hedge(position),
+        )
+        if hedge is not None:
+            position.finalize_hedge(hedge)
 
         position.exit_price = exit_price
         position.exit_fee = exit_fee
@@ -254,26 +232,8 @@ class OrderEngine:
         entry_notional = size * fill_price
         entry_fee = entry_notional * self._cfg.taker_fee_rate
 
-        tp_pct = self._cfg.tp_pct
-        tp_price = fill_price * (1 + tp_pct) if direction == "LONG" else fill_price * (1 - tp_pct)
-
-        # Place TP limit order
-        tp_side = "Sell" if direction == "LONG" else "Buy"
-        tp_result = await self._bybit_request(
-            "POST",
-            "/v5/order/create",
-            {
-                "category": "linear",
-                "symbol": symbol,
-                "side": tp_side,
-                "orderType": "Limit",
-                "qty": qty_str,
-                "price": f"{tp_price:.6f}",
-                "timeInForce": "PostOnly",
-                "reduceOnly": True,
-            },
-        )
-        tp_order_id = tp_result.get("orderId", "")
+        tp_price = fill_price
+        tp_order_id = ""
 
         trade_id = uuid.uuid4().hex
         position = Position(
@@ -286,16 +246,23 @@ class OrderEngine:
             tp_order_id=tp_order_id,
             entry_time=datetime.now(timezone.utc),
             funding_time=opp.next_funding_time,
+            detected_at=opp.detected_at,
             funding_rate=opp.funding_rate,
             interval_hours=opp.interval_hours,
+            mark_price_snapshot=opp.mark_price,
+            open_interest_usd=opp.open_interest_usd,
+            volume_24h_usd=opp.volume_24h_usd,
+            turnover_24h_usd=opp.turnover_24h_usd,
+            expected_net_edge_usd=opp.expected_net_edge_usd,
+            expected_net_edge_bps=opp.expected_net_edge_bps,
             entry_fee=entry_fee,
             state=PositionState.OPEN,
         )
         self._pm.add_position(position)
 
         logger.info(
-            "LIVE OPEN: %s %s | fill=%.6f | size=%.4f | tp_order=%s",
-            direction, symbol, fill_price, size, tp_order_id,
+            "LIVE OPEN: %s %s | fill=%.6f | size=%.4f",
+            direction, symbol, fill_price, size,
         )
         return position
 
@@ -303,7 +270,7 @@ class OrderEngine:
         symbol = position.symbol
         direction = position.direction
 
-        # Step 1: cancel TP order
+        # Step 1: cancel any resting reduce-only order if present
         if position.tp_order_id:
             try:
                 await self._bybit_request(
@@ -316,8 +283,7 @@ class OrderEngine:
                     },
                 )
             except Exception as exc:
-                # 404 means TP already filled — that's fine
-                logger.info("%s: TP cancel result: %s (may be already filled)", symbol, exc)
+                logger.info("%s: resting order cancel result: %s", symbol, exc)
 
         # Step 2: market close
         close_side = "Sell" if direction == "LONG" else "Buy"
@@ -344,6 +310,13 @@ class OrderEngine:
 
         exit_notional = position.size * exit_price
         exit_fee = exit_notional * self._cfg.taker_fee_rate
+
+        hedge = await self._hedge_manager.close_hedge(
+            symbol=position.symbol,
+            hedge=_position_to_hedge(position),
+        )
+        if hedge is not None:
+            position.finalize_hedge(hedge)
 
         position.exit_price = exit_price
         position.exit_fee = exit_fee
@@ -462,3 +435,17 @@ class OrderEngine:
             return f"{qty:.4f}"
         else:
             return f"{qty:.6f}"
+
+
+def _position_to_hedge(position: Position):
+    from hedge.hedge_manager import HedgeLeg
+
+    if not position.hedge_direction or not position.hedge_active:
+        return None
+    return HedgeLeg(
+        direction=position.hedge_direction,
+        size=position.hedge_size,
+        entry_price=position.hedge_entry_price or position.entry_price,
+        entry_fee=position.hedge_entry_fee,
+        active=position.hedge_active,
+    )

@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from engine.order_engine import OrderEngine
     from engine.pnl_engine import PnlEngine
     from database.db import Database
+    from hedge.hedge_manager import HedgeLeg
 
 logger = logging.getLogger(__name__)
 
@@ -36,16 +37,33 @@ class Position:
     tp_order_id: str
     entry_time: datetime    # UTC
     funding_time: datetime  # UTC — the settlement time
+    detected_at: datetime
     funding_rate: float
     interval_hours: float
+    mark_price_snapshot: float = 0.0
+    open_interest_usd: float = 0.0
+    volume_24h_usd: float = 0.0
+    turnover_24h_usd: float = 0.0
+    expected_net_edge_usd: float = 0.0
+    expected_net_edge_bps: float = 0.0
     entry_fee: float
     state: PositionState = PositionState.PENDING
+    funding_pnl: float = 0.0
+    funding_applied: bool = False
+    hedge_direction: Optional[str] = None
+    hedge_size: float = 0.0
+    hedge_entry_price: Optional[float] = None
+    hedge_exit_price: Optional[float] = None
+    hedge_entry_fee: float = 0.0
+    hedge_exit_fee: float = 0.0
+    hedge_pnl: float = 0.0
+    hedge_active: bool = False
 
     # Filled after close
     exit_price: Optional[float] = None
     exit_fee: Optional[float] = None
     exit_time: Optional[datetime] = None
-    close_type: Optional[str] = None   # "TP" | "T5_HARD_EXIT" | "FORCE" | "TIMEOUT"
+    close_type: Optional[str] = None   # "FUNDING_CAPTURE_EXIT" | "FORCE" | "TIMEOUT"
     timing_drift_ms: int = 0
 
     def duration_seconds(self) -> Optional[int]:
@@ -59,9 +77,26 @@ class Position:
         else:
             return (self.entry_price - current_price) / self.entry_price * 100
 
-    def seconds_to_hard_exit(self, hard_exit_sec: int = 5) -> float:
+    def attach_hedge(self, hedge: "HedgeLeg") -> None:
+        self.hedge_direction = hedge.direction
+        self.hedge_size = hedge.size
+        self.hedge_entry_price = hedge.entry_price
+        self.hedge_entry_fee = hedge.entry_fee
+        self.hedge_active = hedge.active
+
+    def finalize_hedge(self, hedge: "HedgeLeg") -> None:
+        self.hedge_direction = hedge.direction
+        self.hedge_size = hedge.size
+        self.hedge_entry_price = hedge.entry_price
+        self.hedge_exit_price = hedge.exit_price
+        self.hedge_entry_fee = hedge.entry_fee
+        self.hedge_exit_fee = hedge.exit_fee
+        self.hedge_pnl = hedge.net_pnl
+        self.hedge_active = hedge.active
+
+    def seconds_to_planned_exit(self, post_funding_exit_sec: int = 15) -> float:
         now = datetime.now(timezone.utc)
-        return max(0.0, (self.funding_time - now).total_seconds() - hard_exit_sec)
+        return max(0.0, (self.funding_time - now).total_seconds() + post_funding_exit_sec)
 
 
 AlertCallback = type(None)  # defined at runtime to avoid circular
@@ -133,17 +168,14 @@ class PositionManager:
     # ── Position lifecycle ────────────────────────────────────────────────────
 
     async def force_close(self, symbol: str, reason: str) -> None:
-        """
-        Force-close a position at market.
-        If already CLOSED (TP filled), returns immediately — no double-close.
-        """
+        """Force-close a position at market if it is still open."""
         async with self._lock:
             pos = self._positions.get(symbol)
             if pos is None:
                 logger.debug("force_close: no position found for %s", symbol)
                 return
             if pos.state == PositionState.CLOSED:
-                logger.debug("force_close: %s already CLOSED (likely TP)", symbol)
+                logger.debug("force_close: %s already CLOSED", symbol)
                 return
 
             logger.info("force_close: closing %s reason=%s", symbol, reason)
@@ -190,6 +222,17 @@ class PositionManager:
 
         await self._finalize_position(pos)
 
+    async def apply_funding_credit(self, symbol: str, funding_pnl: float) -> None:
+        async with self._lock:
+            pos = self._positions.get(symbol)
+            if pos is None or pos.state == PositionState.CLOSED or pos.funding_applied:
+                return
+
+            pos.funding_pnl = funding_pnl
+            pos.funding_applied = True
+
+        logger.info("Funding credit applied: %s | funding_pnl=$%.4f", symbol, funding_pnl)
+
     async def close_all(self, reason: str = "FORCE") -> list[Position]:
         """Close all open positions (used by /forceclose Telegram command)."""
         symbols = list(self.get_active_symbols())
@@ -232,21 +275,13 @@ class PositionManager:
         duration = result.get("duration_sec", 0)
         fees = result.get("entry_fee", 0.0) + result.get("exit_fee", 0.0)
 
-        if pos.close_type == "TP":
-            emoji = "TP HIT"
-            body = (
-                f"{pos.symbol} | {pos.direction} | "
-                f"entry={pos.entry_price:.6f} exit={pos.exit_price:.6f}\n"
-                f"net_pnl=${net_pnl:.4f} ({net_pnl_pct:+.4f}%) | "
-                f"duration={duration}s | fees=${fees:.4f}"
-            )
-        else:
-            win_loss = "WIN" if net_pnl > 0 else "LOSS"
-            emoji = "T-5s HARD EXIT"
-            body = (
-                f"{pos.symbol} | {pos.direction} | {win_loss}\n"
-                f"entry={pos.entry_price:.6f} exit={pos.exit_price:.6f}\n"
-                f"net_pnl=${net_pnl:.4f} ({net_pnl_pct:+.4f}%)"
-            )
+        win_loss = "WIN" if net_pnl > 0 else "LOSS"
+        emoji = "FUNDING EXIT" if pos.close_type == "FUNDING_CAPTURE_EXIT" else "POSITION CLOSED"
+        body = (
+            f"{pos.symbol} | {pos.direction} | {win_loss}\n"
+            f"entry={pos.entry_price:.6f} exit={pos.exit_price:.6f}\n"
+            f"funding=${pos.funding_pnl:.4f} | net_pnl=${net_pnl:.4f} ({net_pnl_pct:+.4f}%) | "
+            f"duration={duration}s | fees=${fees:.4f}"
+        )
 
         return f"{emoji}: {body}"

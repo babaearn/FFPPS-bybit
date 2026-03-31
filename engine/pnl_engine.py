@@ -18,6 +18,8 @@ logger = logging.getLogger(__name__)
 class TradeResult:
     trade_id: str
     symbol: str
+    funding_time: datetime
+    detected_at: datetime
     funding_rate: float
     interval_hours: float
     direction: str
@@ -28,9 +30,19 @@ class TradeResult:
     close_type: str
     entry_fee: float
     exit_fee: float
+    funding_pnl: float
+    hedge_pnl: float
+    hedge_entry_fee: float
+    hedge_exit_fee: float
     raw_pnl: float
     net_pnl: float
     net_pnl_pct: float
+    mark_price_snapshot: float
+    open_interest_usd: float
+    volume_24h_usd: float
+    turnover_24h_usd: float
+    expected_net_edge_usd: float
+    expected_net_edge_bps: float
     entry_time: datetime
     exit_time: datetime
     duration_sec: int
@@ -111,7 +123,11 @@ class PnlEngine:
 
         entry_fee = position.entry_fee
         exit_fee = position.exit_fee or 0.0
-        net_pnl = raw_pnl - entry_fee - exit_fee
+        funding_pnl = position.funding_pnl
+        hedge_pnl = position.hedge_pnl
+        hedge_entry_fee = position.hedge_entry_fee
+        hedge_exit_fee = position.hedge_exit_fee
+        net_pnl = raw_pnl + funding_pnl + hedge_pnl - entry_fee - exit_fee
         net_pnl_pct = net_pnl / entry_notional * 100 if entry_notional else 0.0
 
         exit_time = position.exit_time or datetime.now(timezone.utc)
@@ -121,6 +137,8 @@ class PnlEngine:
         result = TradeResult(
             trade_id=position.trade_id,
             symbol=position.symbol,
+            funding_time=position.funding_time,
+            detected_at=position.detected_at,
             funding_rate=position.funding_rate,
             interval_hours=position.interval_hours,
             direction=direction,
@@ -131,9 +149,19 @@ class PnlEngine:
             close_type=position.close_type or "UNKNOWN",
             entry_fee=entry_fee,
             exit_fee=exit_fee,
+            funding_pnl=funding_pnl,
+            hedge_pnl=hedge_pnl,
+            hedge_entry_fee=hedge_entry_fee,
+            hedge_exit_fee=hedge_exit_fee,
             raw_pnl=raw_pnl,
             net_pnl=net_pnl,
             net_pnl_pct=net_pnl_pct,
+            mark_price_snapshot=position.mark_price_snapshot,
+            open_interest_usd=position.open_interest_usd,
+            volume_24h_usd=position.volume_24h_usd,
+            turnover_24h_usd=position.turnover_24h_usd,
+            expected_net_edge_usd=position.expected_net_edge_usd,
+            expected_net_edge_bps=position.expected_net_edge_bps,
             entry_time=entry_time,
             exit_time=exit_time,
             duration_sec=duration_sec,
@@ -153,6 +181,8 @@ class PnlEngine:
         return {
             "trade_id": result.trade_id,
             "symbol": result.symbol,
+            "funding_time": result.funding_time,
+            "detected_at": result.detected_at,
             "direction": result.direction,
             "entry_price": entry_price,
             "exit_price": exit_price,
@@ -162,11 +192,24 @@ class PnlEngine:
             "net_pnl_pct": net_pnl_pct,
             "entry_fee": entry_fee,
             "exit_fee": exit_fee,
+            "funding_pnl": funding_pnl,
+            "hedge_pnl": hedge_pnl,
+            "hedge_entry_fee": hedge_entry_fee,
+            "hedge_exit_fee": hedge_exit_fee,
             "close_type": result.close_type,
             "duration_sec": duration_sec,
             "timing_drift_ms": result.timing_drift_ms,
             "funding_rate": result.funding_rate,
             "interval_hours": result.interval_hours,
+            "mark_price_snapshot": result.mark_price_snapshot,
+            "open_interest_usd": result.open_interest_usd,
+            "volume_24h_usd": result.volume_24h_usd,
+            "turnover_24h_usd": result.turnover_24h_usd,
+            "expected_net_edge_usd": result.expected_net_edge_usd,
+            "expected_net_edge_bps": result.expected_net_edge_bps,
+            "tp_price": result.tp_price,
+            "entry_time": result.entry_time,
+            "exit_time": result.exit_time,
         }
 
     def _update_stats(self, result: TradeResult) -> None:
@@ -177,7 +220,7 @@ class PnlEngine:
 
         daily.total_trades += 1
         daily.total_net_pnl += result.net_pnl
-        daily.total_fees += result.entry_fee + result.exit_fee
+        daily.total_fees += result.entry_fee + result.exit_fee + result.hedge_entry_fee + result.hedge_exit_fee
 
         if result.net_pnl > 0:
             daily.wins += 1
@@ -191,7 +234,7 @@ class PnlEngine:
 
         self._all_time.total_trades += 1
         self._all_time.total_net_pnl += result.net_pnl
-        self._all_time.total_fees += result.entry_fee + result.exit_fee
+        self._all_time.total_fees += result.entry_fee + result.exit_fee + result.hedge_entry_fee + result.hedge_exit_fee
         if result.net_pnl > 0:
             self._all_time.wins += 1
         self._all_time.hold_durations.append(result.duration_sec)

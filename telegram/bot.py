@@ -131,13 +131,14 @@ class TelegramBot:
             if not opps:
                 await message.answer("No qualifying opportunities found.")
                 return
-            opps_sorted = sorted(opps, key=lambda o: abs(o.funding_rate), reverse=True)
-            lines = ["LIVE SCAN — qualifying symbols:\n"]
+            opps_sorted = sorted(opps, key=lambda o: o.expected_net_edge_usd, reverse=True)
+            lines = ["LIVE SCAN — funding carry candidates:\n"]
             for opp in opps_sorted[:20]:
                 ttf = (opp.next_funding_time - datetime.now(timezone.utc)).total_seconds()
                 lines.append(
-                    f"{opp.symbol} | {opp.direction} | "
+                    f"{opp.symbol} | receive via {opp.direction} | "
                     f"rate={opp.funding_rate*100:+.4f}% | "
+                    f"edge=${opp.expected_net_edge_usd:.2f} | "
                     f"OI=${opp.open_interest_usd/1e6:.1f}M | "
                     f"T-{ttf:.0f}s"
                 )
@@ -159,12 +160,13 @@ class TelegramBot:
             if not upcoming:
                 await message.answer("No qualifying events in next 60 minutes.")
                 return
-            lines = ["UPCOMING TRADE QUEUE (next 60min):\n"]
+            lines = ["UPCOMING FUNDING QUEUE (next 60min):\n"]
             for opp in upcoming[:20]:
                 ttf = (opp.next_funding_time - now).total_seconds()
                 lines.append(
-                    f"{opp.symbol} | {opp.direction} | "
+                    f"{opp.symbol} | receive via {opp.direction} | "
                     f"rate={opp.funding_rate*100:+.4f}% | "
+                    f"edge=${opp.expected_net_edge_usd:.2f} | "
                     f"T-{ttf:.0f}s | "
                     f"OI=${opp.open_interest_usd/1e6:.1f}M"
                 )
@@ -184,7 +186,7 @@ class TelegramBot:
             if len(parts) < 3:
                 await message.answer(
                     "Usage: /set <param> <value>\n"
-                    "Params: threshold, position_size, leverage, daily_loss, min_oi"
+                    "Params: threshold, position_size, leverage, daily_loss, min_oi, min_edge, hedge_cost, hedge_ratio, hedge_enabled"
                 )
                 return
             param, value = parts[1], parts[2]
@@ -230,8 +232,8 @@ class TelegramBot:
             if not _authorized(message):
                 return
             help_text = (
-                "FUNDING MOMENTUM SNIPER — Commands\n\n"
-                "/status       — Active positions + bot state\n"
+                "FUNDING CARRY FARMER — Commands\n\n"
+                "/status       — Active funding captures + bot state\n"
                 "/pnl          — PnL summary today + all time\n"
                 "/journal [n]  — Last n trades (default 10)\n"
                 "/scan         — Live scan now\n"
@@ -258,18 +260,20 @@ class TelegramBot:
         else:
             lines.append(f"Positions ({len(open_positions)} open):\n")
             for pos in open_positions:
-                ttf = pos.seconds_to_hard_exit(self._cfg.hard_exit_sec)
+                ttf = pos.seconds_to_planned_exit(self._cfg.hard_exit_sec)
                 lines.append(
                     f"  {pos.symbol} | {pos.direction} | "
                     f"entry={pos.entry_price:.6f} | "
-                    f"TP={pos.tp_price:.6f} | "
-                    f"hard_exit_in={ttf:.0f}s"
+                    f"funding_credit=${pos.funding_pnl:.4f} | "
+                    f"hedge={pos.hedge_direction or 'off'}:{pos.hedge_size:.4f} | "
+                    f"planned_exit_in={ttf:.0f}s"
                 )
 
         lines.append(
             f"\nConfig: threshold={self._cfg.funding_threshold:.4f} | "
             f"size=${self._cfg.position_size_usd:.0f} | "
-            f"leverage={self._cfg.max_leverage}x"
+            f"leverage={self._cfg.max_leverage}x | "
+            f"min_edge=${self._cfg.min_expected_net_edge_usd:.2f}"
         )
         return "\n".join(lines)
 

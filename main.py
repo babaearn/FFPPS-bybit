@@ -1,5 +1,5 @@
 """
-Funding Momentum Sniper — main entry point.
+Funding Carry Farmer — main entry point.
 Wires all components, starts async tasks, handles graceful shutdown.
 """
 
@@ -45,7 +45,7 @@ async def main() -> None:
     setup_logging()
 
     logger.info("=" * 60)
-    logger.info("FUNDING MOMENTUM SNIPER starting")
+    logger.info("FUNDING CARRY FARMER starting")
     logger.info("  Mode:    %s", "PAPER" if PAPER_MODE else "LIVE")
     logger.info("  API key: %s", mask_secret(BYBIT_API_KEY))
     logger.info("  TG bot:  %s", mask_secret(TELEGRAM_BOT_TOKEN))
@@ -55,7 +55,7 @@ async def main() -> None:
     http_client = httpx.AsyncClient(
         limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
         timeout=httpx.Timeout(10.0),
-        headers={"User-Agent": "FundingSniper/1.0"},
+        headers={"User-Agent": "FundingCarryFarmer/1.0"},
     )
 
     # ── Construct components ──────────────────────────────────────────────────
@@ -109,15 +109,17 @@ async def main() -> None:
     # Now rebuild scanner with proper entry_timer reference
     async def on_opportunity(opp: FundingOpportunity) -> None:
         logger.info(
-            "SCAN HIT: %s %s | rate=%.4f%% | OI=$%.0f | T-%.0fs",
+            "SCAN HIT: %s %s | rate=%.4f%% | OI=$%.0f | edge=$%.2f | T-%.0fs",
             opp.direction, opp.symbol,
             opp.funding_rate * 100,
             opp.open_interest_usd,
+            opp.expected_net_edge_usd,
             (opp.next_funding_time - datetime.now(timezone.utc)).total_seconds(),
         )
         await tg_bot.send_alert(
-            f"SCAN HIT: {opp.symbol} | {opp.direction} | "
+            f"SCAN HIT: {opp.symbol} | receive via {opp.direction} | "
             f"rate={opp.funding_rate*100:+.4f}% | "
+            f"edge=${opp.expected_net_edge_usd:.2f} | "
             f"OI=${opp.open_interest_usd/1e6:.1f}M | "
             f"T-{(opp.next_funding_time - datetime.now(timezone.utc)).total_seconds():.0f}s"
         )
@@ -143,11 +145,13 @@ async def main() -> None:
 
     # ── Startup alert ─────────────────────────────────────────────────────────
     startup_msg = (
-        f"Funding Sniper STARTED\n"
+        f"Funding Carry Farmer STARTED\n"
         f"Mode: {'PAPER' if PAPER_MODE else 'LIVE'} | "
         f"Threshold: {cfg.funding_threshold*100:.2f}% | "
         f"Size: ${cfg.position_size_usd:.0f} | "
-        f"Leverage: {cfg.max_leverage}x"
+        f"Leverage: {cfg.max_leverage}x | "
+        f"Min edge: ${cfg.min_expected_net_edge_usd:.2f} | "
+        f"Hedge: {'on' if cfg.hedge_enabled else 'off'} x{cfg.hedge_ratio:.2f}"
     )
 
     # ── Start background tasks ────────────────────────────────────────────────
@@ -213,7 +217,7 @@ async def main() -> None:
     await db.close()
     await http_client.aclose()
 
-    logger.info("Funding Sniper stopped cleanly.")
+    logger.info("Funding Carry Farmer stopped cleanly.")
 
 
 def _make_opportunity_handler(cfg, tg_bot, entry_timer_holder):

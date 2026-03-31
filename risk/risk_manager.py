@@ -1,6 +1,5 @@
 """
-Risk manager — pre-trade gate checks.
-All gates must pass before entry is allowed at T-90s.
+Risk manager — pre-trade gate checks for funding-carry entries.
 """
 
 import logging
@@ -70,11 +69,19 @@ class RiskManager:
         if self._pm.is_open(opp.symbol):
             return False, f"Position already open for {opp.symbol}"
 
+        # Gate 6: Expected net carry edge must clear fees and hedge estimate
+        if opp.expected_net_edge_usd < cfg.min_expected_net_edge_usd:
+            return False, (
+                f"Expected net edge ${opp.expected_net_edge_usd:.2f} below minimum "
+                f"${cfg.min_expected_net_edge_usd:.2f}"
+            )
+
         logger.info(
-            "RiskManager: all gates passed for %s %s (rate=%.4f%%, OI=$%.0f)",
+            "RiskManager: all gates passed for %s %s (rate=%.4f%%, OI=$%.0f, edge=$%.2f)",
             opp.direction, opp.symbol,
             opp.funding_rate * 100,
             opp.open_interest_usd,
+            opp.expected_net_edge_usd,
         )
         return True, ""
 
