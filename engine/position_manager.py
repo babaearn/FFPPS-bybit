@@ -40,13 +40,15 @@ class Position:
     detected_at: datetime
     funding_rate: float
     interval_hours: float
+    entry_fee: float
     mark_price_snapshot: float = 0.0
     open_interest_usd: float = 0.0
     volume_24h_usd: float = 0.0
     turnover_24h_usd: float = 0.0
     expected_net_edge_usd: float = 0.0
     expected_net_edge_bps: float = 0.0
-    entry_fee: float
+
+    # Filled after close
     state: PositionState = PositionState.PENDING
     funding_pnl: float = 0.0
     funding_applied: bool = False
@@ -58,8 +60,6 @@ class Position:
     hedge_exit_fee: float = 0.0
     hedge_pnl: float = 0.0
     hedge_active: bool = False
-
-    # Filled after close
     exit_price: Optional[float] = None
     exit_fee: Optional[float] = None
     exit_time: Optional[datetime] = None
