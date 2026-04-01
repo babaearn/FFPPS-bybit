@@ -283,6 +283,97 @@ class Database:
             logger.exception("DB: get_recent_trades failed")
             return []
 
+    async def get_strategy_summary(self, close_type: str) -> Optional[dict]:
+        if not self._enabled or not self._pool:
+            return None
+        try:
+            async with self._pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    """
+                    select
+                        count(*) as trades,
+                        count(*) filter (where net_pnl > 0) as wins,
+                        count(*) filter (where net_pnl <= 0) as losses,
+                        coalesce(sum(net_pnl), 0) as net_pnl,
+                        coalesce(sum(funding_pnl), 0) as funding_pnl,
+                        coalesce(sum(hedge_pnl), 0) as hedge_pnl,
+                        coalesce(sum(raw_pnl), 0) as raw_pnl,
+                        coalesce(sum(entry_fee + coalesce(exit_fee,0) + coalesce(hedge_entry_fee,0) + coalesce(hedge_exit_fee,0)), 0) as fees,
+                        coalesce(avg(duration_sec), 0) as avg_hold_sec,
+                        min(created_at) as first_created,
+                        max(created_at) as last_created,
+                        coalesce(avg(expected_net_edge_usd), 0) as avg_expected_edge_usd,
+                        coalesce(avg(expected_net_edge_bps), 0) as avg_expected_edge_bps
+                    from trades
+                    where close_type = $1
+                    """,
+                    close_type,
+                )
+                return dict(row) if row else None
+        except Exception:
+            logger.exception("DB: get_strategy_summary failed for %s", close_type)
+            return None
+
+    async def get_strategy_breakdowns(self, close_type: str, limit: int = 5) -> dict:
+        if not self._enabled or not self._pool:
+            return {"best_symbols": [], "worst_symbols": [], "time_windows": []}
+        try:
+            async with self._pool.acquire() as conn:
+                best_rows = await conn.fetch(
+                    """
+                    select
+                        symbol,
+                        count(*) as trades,
+                        coalesce(sum(net_pnl), 0) as net_pnl
+                    from trades
+                    where close_type = $1
+                    group by symbol
+                    order by sum(net_pnl) desc, count(*) desc
+                    limit $2
+                    """,
+                    close_type,
+                    limit,
+                )
+                worst_rows = await conn.fetch(
+                    """
+                    select
+                        symbol,
+                        count(*) as trades,
+                        coalesce(sum(net_pnl), 0) as net_pnl
+                    from trades
+                    where close_type = $1
+                    group by symbol
+                    order by sum(net_pnl) asc, count(*) desc
+                    limit $2
+                    """,
+                    close_type,
+                    limit,
+                )
+                time_rows = await conn.fetch(
+                    """
+                    select
+                        extract(hour from coalesce(funding_time, created_at))::int as utc_hour,
+                        count(*) as trades,
+                        coalesce(sum(net_pnl), 0) as net_pnl,
+                        coalesce(avg(abs(funding_rate)), 0) as avg_abs_funding
+                    from trades
+                    where close_type = $1
+                    group by utc_hour
+                    order by count(*) desc, sum(net_pnl) desc, utc_hour
+                    limit $2
+                    """,
+                    close_type,
+                    limit,
+                )
+                return {
+                    "best_symbols": [dict(r) for r in best_rows],
+                    "worst_symbols": [dict(r) for r in worst_rows],
+                    "time_windows": [dict(r) for r in time_rows],
+                }
+        except Exception:
+            logger.exception("DB: get_strategy_breakdowns failed for %s", close_type)
+            return {"best_symbols": [], "worst_symbols": [], "time_windows": []}
+
     @property
     def is_enabled(self) -> bool:
         return self._enabled and self._pool is not None

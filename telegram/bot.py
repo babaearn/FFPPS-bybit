@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     from engine.order_engine import OrderEngine
     from scanner.funding_scanner import FundingScanner
     from risk.risk_manager import RiskManager
+    from database.db import Database
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +51,7 @@ class TelegramBot:
         self._order_engine: Optional["OrderEngine"] = None
         self._scanner: Optional["FundingScanner"] = None
         self._risk_manager: Optional["RiskManager"] = None
+        self._db: Optional["Database"] = None
         self._enabled = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
 
     def wire(
@@ -59,12 +61,14 @@ class TelegramBot:
         order_engine: "OrderEngine",
         scanner: "FundingScanner",
         risk_manager: "RiskManager",
+        db: "Database",
     ) -> None:
         self._position_manager = position_manager
         self._pnl_engine = pnl_engine
         self._order_engine = order_engine
         self._scanner = scanner
         self._risk_manager = risk_manager
+        self._db = db
 
     async def start(self) -> None:
         if not self._enabled:
@@ -121,6 +125,12 @@ class TelegramBot:
             parts = (message.text or "").split()
             n = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 10
             await message.answer(self._build_journal(n))
+
+        @r.message(Command("newpnl"))
+        async def cmd_newpnl(message: Message) -> None:
+            if not _authorized(message):
+                return
+            await message.answer(await self._build_new_pnl())
 
         @r.message(Command("scan"))
         async def cmd_scan(message: Message) -> None:
@@ -235,6 +245,7 @@ class TelegramBot:
                 "FUNDING CARRY FARMER — Commands\n\n"
                 "/status       — Active funding captures + bot state\n"
                 "/pnl          — PnL summary today + all time\n"
+                "/newpnl       — DB-backed carry strategy sanity check\n"
                 "/journal [n]  — Last n trades (default 10)\n"
                 "/scan         — Live scan now\n"
                 "/next         — Upcoming trade queue (60min)\n"
@@ -329,4 +340,78 @@ class TelegramBot:
                 lines.append(f"  {k}: {v:.6g}")
             else:
                 lines.append(f"  {k}: {v}")
+        return "\n".join(lines)
+
+    async def _build_new_pnl(self) -> str:
+        if not self._db or not self._db.is_enabled:
+            return "Database-backed carry report unavailable: database is not enabled."
+
+        summary = await self._db.get_strategy_summary("FUNDING_CAPTURE_EXIT")
+        if not summary or int(summary.get("trades", 0) or 0) == 0:
+            return "No completed carry-strategy trades found yet."
+
+        breakdowns = await self._db.get_strategy_breakdowns("FUNDING_CAPTURE_EXIT")
+
+        trades = int(summary.get("trades", 0) or 0)
+        wins = int(summary.get("wins", 0) or 0)
+        losses = int(summary.get("losses", 0) or 0)
+        win_rate = (wins / trades * 100) if trades else 0.0
+        roi_pct = float(summary.get("net_pnl", 0) or 0) / self._cfg.paper_capital * 100 if self._cfg.paper_capital else 0.0
+
+        lines = [
+            "NEW STRATEGY SANITY CHECK",
+            "",
+            f"Trades:   {trades}",
+            f"Wins:     {wins}",
+            f"Losses:   {losses}",
+            f"Win rate: {win_rate:.1f}%",
+            f"Net PnL:  ${float(summary.get('net_pnl', 0) or 0):.4f}",
+            f"ROI:      {roi_pct:.2f}%",
+            f"Funding:  ${float(summary.get('funding_pnl', 0) or 0):.4f}",
+            f"Hedge:    ${float(summary.get('hedge_pnl', 0) or 0):.4f}",
+            f"Raw PnL:  ${float(summary.get('raw_pnl', 0) or 0):.4f}",
+            f"Fees:     ${float(summary.get('fees', 0) or 0):.4f}",
+            f"Avg hold: {float(summary.get('avg_hold_sec', 0) or 0):.0f}s",
+            f"Avg edge: ${float(summary.get('avg_expected_edge_usd', 0) or 0):.2f} ({float(summary.get('avg_expected_edge_bps', 0) or 0):.1f} bps)",
+        ]
+
+        best_symbols = breakdowns.get("best_symbols", [])
+        if best_symbols:
+            lines.append("")
+            lines.append("Best symbols:")
+            for row in best_symbols[:3]:
+                lines.append(
+                    f"  {row['symbol']}: ${float(row['net_pnl']):.4f} over {int(row['trades'])} trade(s)"
+                )
+
+        worst_symbols = breakdowns.get("worst_symbols", [])
+        if worst_symbols:
+            lines.append("")
+            lines.append("Weakest symbols:")
+            for row in worst_symbols[:3]:
+                lines.append(
+                    f"  {row['symbol']}: ${float(row['net_pnl']):.4f} over {int(row['trades'])} trade(s)"
+                )
+
+        time_windows = breakdowns.get("time_windows", [])
+        if time_windows:
+            lines.append("")
+            lines.append("Top UTC windows:")
+            for row in time_windows[:3]:
+                utc_hour = int(row["utc_hour"])
+                ist_hour = (utc_hour + 5) % 24
+                ist_minute = 30
+                ampm = "AM" if ist_hour < 12 else "PM"
+                display_hour = ist_hour % 12 or 12
+                lines.append(
+                    f"  {utc_hour:02d}:00 UTC / {display_hour}:{ist_minute:02d} {ampm} IST: "
+                    f"{int(row['trades'])} trade(s), ${float(row['net_pnl']):.4f}"
+                )
+
+        first_created = summary.get("first_created")
+        last_created = summary.get("last_created")
+        if first_created and last_created:
+            lines.append("")
+            lines.append(f"Window: {first_created} -> {last_created}")
+
         return "\n".join(lines)

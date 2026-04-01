@@ -138,6 +138,7 @@ async def main() -> None:
         order_engine=order_engine,
         scanner=scanner_final,
         risk_manager=risk_manager,
+        db=db,
     )
 
     # ── Connect database ──────────────────────────────────────────────────────
